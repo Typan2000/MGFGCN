@@ -1,2 +1,2 @@
-# MGDGCN
-Multi-Granularity Spatio-temporal Dynamic Graph Convolutional network for traffic flow forecasting
+# MGFGCN
+Multi-Granularity Dynamic Spatio-temporal Fusion Graph Convolutional network for traffic flow forecasting
