@@ -3,11 +3,12 @@ import numpy as np
 import argparse
 import time
 import util
-from engine import trainer
-from pathlib import Path
 import logging
 import os
 import json
+from engine import trainer
+from pathlib import Path
+from datetime import datetime
 
 def save_model(path: str, **save_dict):
     os.makedirs(os.path.split(path)[0], exist_ok=True)
@@ -18,6 +19,52 @@ def load_dataset_config(config_path):
         config = json.load(file)
     return config
 
+def build_logger():
+    logger = logging.getLogger(__name__)
+    logger.handlers.clear()
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    Path("log/").mkdir(parents=True, exist_ok=True)
+    formatter = logging.Formatter(
+        '%(asctime)s | %(levelname)s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    fh = logging.FileHandler(f"log/{current_time}_MGFGCN.log")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(formatter)
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(formatter)
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return logger
+
+def format_iter_log(epoch, iteration, loss, mape, rmse):
+    return (
+        f"[Epoch {epoch:03d} | Iter {iteration:03d}] "
+        f"train_loss={loss:.4f} | train_mape={mape:.4f} | train_rmse={rmse:.4f}"
+    )
+
+def format_epoch_log(epoch, train_metrics, valid_metrics, train_secs, infer_secs, best_loss, patience_count, checkpoint_path, is_best):
+    status_text = (
+        f"Status | best_valid_loss={best_loss:.4f} | best" '\n'
+        f"Checkpoint saved: " + checkpoint_path
+        if is_best else
+        f"Status | best_valid_loss={best_loss:.4f} | no improvement for {patience_count} epoch"
+    )
+    return '\n'.join([
+        '=' * 88,
+        f"Epoch {epoch:03d}",
+        f"Train | loss={train_metrics[0]:.4f} | mape={train_metrics[1]:.4f} | rmse={train_metrics[2]:.4f} | time={train_secs:.2f}s",
+        f"Valid | loss={valid_metrics[0]:.4f} | mape={valid_metrics[1]:.4f} | rmse={valid_metrics[2]:.4f} | time={infer_secs:.2f}s",
+        status_text,
+        '=' * 117
+    ])
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config_path', type=str, default='config/PeMS08.json', help='config_file')
@@ -25,20 +72,8 @@ def main():
     args = parser.parse_args()
     config_path = args.config_path
     config = load_dataset_config(config_path)
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.DEBUG)
-    Path("log/").mkdir(parents=True, exist_ok=True)
-    fh = logging.FileHandler(f"log/{str(time.time())}_restore_{'MGFGCN'}.log")
-    fh.setLevel(logging.DEBUG)
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.WARN)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    fh.setFormatter(formatter)
-    ch.setFormatter(formatter)
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-    logger.info(config)
+    logger = build_logger()
+    logger.info("Loaded config: %s", config)
     if not os.path.exists(config['save']):
         os.makedirs(config['save'])
     torch.manual_seed(config['seed'])
@@ -49,7 +84,8 @@ def main():
     scaler = dataloader['scaler']
     engine = trainer(config, scaler, distance_matrix, args.device)
 
-    print("start training...", flush=True)
+    logger.info("%s", '=' * 88)
+    logger.info("Start training")
     his_loss = []
     val_time = []
     train_time = []
@@ -65,16 +101,15 @@ def main():
         dataloader['train_loader'].shuffle()
         for iter, (x, y, t_i) in enumerate(dataloader['train_loader'].get_iterator()):
             trainx = torch.Tensor(x).to(device)
-            trainx = trainx.transpose(1, 3)
             trainy = torch.Tensor(y).to(device)
-            trainy = trainy.transpose(1, 3)
             metrics = engine.train(trainx, trainy[:, 0, :, :], t_i)
             train_loss.append(metrics[0])
             train_mape.append(metrics[1])
             train_rmse.append(metrics[2])
             if iter % config['print_every'] == 0:
-                log = 'Iter: {:03d}, Train Loss: {:.4f}, Train MAPE: {:.4f}, Train RMSE: {:.4f}'
-                logger.info(log.format(iter, train_loss[-1], train_mape[-1], train_rmse[-1]))
+                logger.info(
+                    format_iter_log(i, iter, train_loss[-1], train_mape[-1], train_rmse[-1])
+                )
         engine.scheduler.step()
         t2 = time.time()
         train_time.append(t2 - t1)
@@ -85,16 +120,12 @@ def main():
         s1 = time.time()
         for iter, (x, y, t_i) in enumerate(dataloader['val_loader'].get_iterator()):
             testx = torch.Tensor(x).to(device)
-            testx = testx.transpose(1, 3)
             testy = torch.Tensor(y).to(device)
-            testy = testy.transpose(1, 3)
             metrics = engine.eval(testx, testy[:, 0, :, :], t_i)
             valid_loss.append(metrics[0])
             valid_mape.append(metrics[1])
             valid_rmse.append(metrics[2])
         s2 = time.time()
-        log = 'Epoch: {:03d}, Inference Time: {:.4f} secs'
-        logger.info(log.format(i, (s2 - s1)))
         val_time.append(s2 - s1)
         mtrain_loss = np.mean(train_loss)
         mtrain_mape = np.mean(train_mape)
@@ -105,37 +136,45 @@ def main():
         mtrain_loss_list.append(mtrain_loss)
         mval_loss_list.append(mvalid_loss)
 
-        if len(his_loss) > 0 and mvalid_loss < np.min(his_loss):
+        is_best = len(his_loss) == 0 or mvalid_loss < np.min(his_loss)
+        if is_best:
             count = 0
+            checkpoint_path = config['save'] + 'MGFGCN_' + config['dataset_class'] + "_epoch_" + str(i) + "_" + str(round(mvalid_loss, 2)) + ".pth"
+            torch.save(engine.model.state_dict(), checkpoint_path)
         else:
             count += 1
         his_loss.append(mvalid_loss)
-        log = 'Epoch: {:03d}, Train Loss: {:.4f}, Train MAPE: {:.4f}, Train RMSE: {:.4f}, Valid Loss: {:.4f}, Valid MAPE: {:.4f}, Valid RMSE: {:.4f}, Training Time: {:.4f}/epoch'
+        best_valid_loss = np.min(his_loss)
         logger.info(
-            log.format(i, mtrain_loss, mtrain_mape, mtrain_rmse, mvalid_loss, mvalid_mape, mvalid_rmse, (t2 - t1)))
-        torch.save(engine.model.state_dict(),
-                   config['save'] + 'MGFGCN' + "_epoch_" + str(i) + "_" + str(round(mvalid_loss, 2)) + ".pth")
+            format_epoch_log(i,(mtrain_loss, mtrain_mape, mtrain_rmse),(mvalid_loss, mvalid_mape, mvalid_rmse),
+                t2 - t1, s2 - s1,
+                best_valid_loss,
+                count,
+                checkpoint_path,
+                is_best
+            )
+        )
         if count >= config['patience']:
+            logger.info("Early stopping triggered at epoch %03d", i)
             break
     logger.info("Average Training Time: {:.4f} secs/epoch".format(np.mean(train_time)))
     logger.info("Average Inference Time: {:.4f} secs".format(np.mean(val_time)))
 
     bestid = np.argmin(his_loss)
     engine.model.load_state_dict(torch.load(
-        config['save'] + 'MGFGCN' + "_epoch_" + str(bestid + 1) + "_" + str(round(his_loss[bestid], 2)) + ".pth"))
+        config['save'] + 'MGFGCN_' + config['dataset_class'] + "_epoch_" + str(bestid + 1) + "_" + str(round(his_loss[bestid], 2)) + ".pth"))
     outputs = []
     realy = torch.Tensor(dataloader['y_test']).to(device)
-    realy = realy.transpose(1, 3)[:, 0, :, :]
+    realy = realy[:, 0, :, :]
 
     for iter, (x, y, t_i) in enumerate(dataloader['test_loader'].get_iterator()):
         testx = torch.Tensor(x).to(device)
-        testx = testx.transpose(1, 3)
         with torch.no_grad():
-            preds = engine.model(testx, t_i).transpose(1, 3)
+            preds = engine.model(testx, t_i)
         outputs.append(preds.squeeze())
 
     yhat = torch.cat(outputs, dim=0)
-    yhat = yhat[:realy.size(0), ...]
+    yhat = yhat[:realy.size(0), ...].transpose(1, 2)
     logger.info("Training finished")
     log = 'The valid loss on best model is {:.4f}'
     logger.info(log.format(his_loss[bestid]))
@@ -143,7 +182,7 @@ def main():
     amae = []
     amape = []
     armse = []
-    for i in range(12):
+    for i in range(config['output_dim']):
         pred = scaler.inverse_transform(yhat[:, :, i])
         real = realy[:, :, i]
         metrics = util.metric(pred, real)
@@ -153,7 +192,7 @@ def main():
         amape.append(metrics[1])
         armse.append(metrics[2])
 
-    log = 'On average over 12 horizons, Test MAE: {:.4f}, Test MAPE: {:.4f}, Test RMSE: {:.4f}'
+    log = 'On average over '+ str(config['output_dim']) + ' horizons, Test MAE: {:.4f}, Test MAPE: {:.4f}, Test RMSE: {:.4f}'
     logger.info(log.format(np.mean(amae), np.mean(amape), np.mean(armse)))
     logger.info(config)
 
